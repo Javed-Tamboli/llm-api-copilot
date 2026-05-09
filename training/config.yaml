@@ -1,0 +1,18 @@
+# Model
+model_id: "meta-llama/Meta-Llama-3.1-8B-Instruct"
+output_dir: "models/llama31-api-copilot-adapter"
+
+# Data
+train_data: "data/processed/train.jsonl"
+max_seq_length: 1024
+
+# LoRA adapter settings
+lora_r: 16           # rank — higher = more capacity, more memory
+lora_alpha: 32       # scaling = alpha / r; 2x rank is a common baseline
+lora_dropout: 0.05
+
+# Training
+epochs: 3
+batch_size: 2
+grad_accum_steps: 4  # effective batch size = batch_size * grad_accum = 8
+learning_rate: 0.0002
