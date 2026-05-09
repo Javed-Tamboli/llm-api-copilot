@@ -1,0 +1,154 @@
+"""
+run_eval.py
+-----------
+Runs the full evaluation pipeline:
+  1. Loads test set
+  2. Generates predictions from the fine-tuned model
+  3. Generates predictions from GPT-4o (zero-shot baseline)
+  4. Scores both using LLM-as-a-Judge
+  5. Logs all results to MLflow
+  6. Prints a comparison summary
+"""
+
+import json
+import os
+import mlflow
+from openai import OpenAI
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from peft import PeftModel
+import torch
+from evaluation.llm_judge import judge
+from dotenv import load_dotenv
+
+load_dotenv()
+
+ADAPTER_PATH  = "models/llama31-api-copilot-adapter"
+BASE_MODEL_ID = "meta-llama/Meta-Llama-3.1-8B-Instruct"
+TEST_DATA     = "data/processed/test.jsonl"
+MLFLOW_URI    = os.getenv("MLFLOW_TRACKING_URI", "mlruns")
+
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+
+def load_finetuned_model():
+    """Loads the base Llama 3.1 model with our LoRA adapter merged on top."""
+    print("Loading fine-tuned model...")
+    tokenizer = AutoTokenizer.from_pretrained(ADAPTER_PATH)
+
+    base_model = AutoModelForCausalLM.from_pretrained(
+        BASE_MODEL_ID,
+        torch_dtype=torch.bfloat16,
+        device_map="auto",
+        token=os.getenv("HF_TOKEN")
+    )
+    model = PeftModel.from_pretrained(base_model, ADAPTER_PATH)
+    model.eval()
+    return model, tokenizer
+
+
+def generate_finetuned(model, tokenizer, question: str) -> str:
+    """Runs inference on the fine-tuned model."""
+    prompt = (
+        f"<|begin_of_text|>"
+        f"<|start_header_id|>user<|end_header_id|>\n{question}<|eot_id|>"
+        f"<|start_header_id|>assistant<|end_header_id|>\n"
+    )
+    inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+    with torch.no_grad():
+        outputs = model.generate(
+            **inputs,
+            max_new_tokens=300,
+            temperature=0.1,
+            do_sample=True,
+            pad_token_id=tokenizer.eos_token_id
+        )
+    decoded = tokenizer.decode(outputs[0], skip_special_tokens=True)
+    # Strip the prompt prefix from the output
+    return decoded[len(prompt):].strip()
+
+
+def generate_gpt4o_baseline(question: str) -> str:
+    """Zero-shot GPT-4o response for comparison."""
+    response = client.chat.completions.create(
+        model="gpt-4o",
+        messages=[{"role": "user", "content": question}],
+        temperature=0
+    )
+    return response.choices[0].message.content
+
+
+def main():
+    # Load test data
+    with open(TEST_DATA, "r") as f:
+        test_examples = [json.loads(line) for line in f if line.strip()]
+    print(f"Evaluating on {len(test_examples)} test examples\n")
+
+    model, tokenizer = load_finetuned_model()
+
+    ft_scores, baseline_scores = [], []
+    results_log = []
+
+    for i, example in enumerate(test_examples):
+        text = example["text"]
+
+        # Extract question and reference from the template
+        user_start  = text.find("<|start_header_id|>user<|end_header_id|>\n") + len("<|start_header_id|>user<|end_header_id|>\n")
+        user_end    = text.find("<|eot_id|>", user_start)
+        asst_start  = text.rfind("<|start_header_id|>assistant<|end_header_id|>\n") + len("<|start_header_id|>assistant<|end_header_id|>\n")
+        asst_end    = text.rfind("<|eot_id|>")
+
+        question  = text[user_start:user_end].strip()
+        reference = text[asst_start:asst_end].strip()
+
+        print(f"[{i+1}/{len(test_examples)}] Evaluating: {question[:60]}...")
+
+        ft_pred       = generate_finetuned(model, tokenizer, question)
+        baseline_pred = generate_gpt4o_baseline(question)
+
+        ft_score       = judge(question, reference, ft_pred)
+        baseline_score = judge(question, reference, baseline_pred)
+
+        ft_scores.append(ft_score.normalized)
+        baseline_scores.append(baseline_score.normalized)
+
+        results_log.append({
+            "question":        question,
+            "ft_score":        ft_score.normalized,
+            "baseline_score":  baseline_score.normalized,
+            "ft_reasoning":    ft_score.reasoning,
+        })
+
+        print(f"  Fine-tuned: {ft_score.normalized:.2f}  |  GPT-4o baseline: {baseline_score.normalized:.2f}")
+
+    # Aggregate
+    avg_ft       = round(sum(ft_scores) / len(ft_scores), 3)
+    avg_baseline = round(sum(baseline_scores) / len(baseline_scores), 3)
+    improvement  = round((avg_ft - avg_baseline) / avg_baseline * 100, 1)
+
+    print(f"\n{'='*50}")
+    print(f"Fine-tuned model avg score : {avg_ft}")
+    print(f"GPT-4o baseline avg score  : {avg_baseline}")
+    print(f"Improvement                : +{improvement}%")
+    print(f"{'='*50}\n")
+
+    # Log to MLflow
+    mlflow.set_tracking_uri(MLFLOW_URI)
+    mlflow.set_experiment("llama31-api-copilot-eval")
+
+    with mlflow.start_run():
+        mlflow.log_metrics({
+            "avg_finetuned_score":  avg_ft,
+            "avg_baseline_score":   avg_baseline,
+            "improvement_pct":      improvement,
+            "num_test_examples":    len(test_examples),
+        })
+        # Save detailed results as artifact
+        with open("evaluation/results.json", "w") as f:
+            json.dump(results_log, f, indent=2)
+        mlflow.log_artifact("evaluation/results.json")
+
+    print("Results logged to MLflow.")
+
+
+if __name__ == "__main__":
+    main()
