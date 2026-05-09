@@ -1,0 +1,37 @@
+# Secrets
+.env
+
+# Model weights (too large for GitHub — use HuggingFace Hub instead)
+models/
+*.bin
+*.safetensors
+*.pt
+*.pth
+
+# MLflow local runs
+mlruns/
+
+# Processed data (auto-generated from sample_data.jsonl)
+data/processed/
+
+# Eval output
+evaluation/results.json
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+.Python
+
+# Virtual environment
+venv/
+env/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
